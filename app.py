@@ -1,175 +1,142 @@
 import streamlit as st
 import pandas as pd
 from io import BytesIO
-from utils.site_utils import get_site_by_code
 
-st.set_page_config(page_title="站点拣货单生成系统（升级版）", layout="wide")
+st.set_page_config(page_title="拣货单生成系统", layout="wide")
 
-st.title("⛽ 便利店 & 参股站 拣货单生成系统（升级版）")
-st.caption("版本 v2.0 · 站点仓库从 Supabase 自动读取 · 支持铺货记录（防止重复铺货）")
+st.title("⛽ 便利店 & 参股站 拣货单生成系统")
+st.caption("版本 v2.1 · 修复字段名 · 支持你当前 Excel 格式")
 
-
-# ---------------------------------------------------
-# 上传 Excel 文件
-# ---------------------------------------------------
-st.markdown("### 第一步：上传订单文件")
+############################################################
+# 1. 上传文件
+############################################################
+st.markdown("### 📤 第一步：上传订单 & 数据文件")
 
 col1, col2 = st.columns(2)
 
 with col1:
-    oil_file = st.file_uploader("📄 ① 官网页订单（新编码）", type=["xlsx"])
-    manual_file = st.file_uploader("📄 ② 手工订单（参股站旧编码）", type=["xlsx"])
+    oil_file = st.file_uploader("① 官网订单（新编码）", type=["xlsx"])
+    manual_file = st.file_uploader("② 手工订单（旧编码）", type=["xlsx"])
 
 with col2:
-    master_file = st.file_uploader("📄 ③ 主表（SKU）", type=["xlsx"])
+    master_file = st.file_uploader("③ 主表（SKU）", type=["xlsx"])
+    site_file = st.file_uploader("④ 站点仓库对照表（code+name+warehouse）", type=["xlsx"])
 
-if not (oil_file and manual_file and master_file):
-    st.info("👆 请上传全部文件后继续")
+if not oil_file or not manual_file or not master_file or not site_file:
+    st.info("👆 请上传全部 4 个文件后继续")
     st.stop()
 
-
-# ---------------------------------------------------
-# 读取 Excel
-# ---------------------------------------------------
+############################################################
+# 2. 读取
+############################################################
 try:
     oil = pd.read_excel(oil_file)
     manual = pd.read_excel(manual_file)
     master = pd.read_excel(master_file)
+    site = pd.read_excel(site_file)
+    st.success("🎉 文件读取成功！")
 except Exception as e:
-    st.error(f"❌ Excel 文件读取失败：{e}")
+    st.error(f"❌ Excel 读取失败：{e}")
     st.stop()
 
-st.success("文件读取成功！")
+############################################################
+# 3. 字段标准化（替换旧逻辑）
+############################################################
 
+# 必须包含：code / name / warehouse
+required_cols = ["code", "name", "warehouse"]
 
-# ---------------------------------------------------
-# 字段统一（按你提供的真实字段）
-# ---------------------------------------------------
+for col in required_cols:
+    if col not in site.columns:
+        st.error(f"❌ 站点表缺少字段：{col}")
+        st.stop()
+
+site["code"] = site["code"].astype(str).str.strip()
+
+############################################################
+# 4. 订单字段清洗
+############################################################
 
 oil.rename(columns={
-    "收货组织编码": "站点编码",
-    "收货组织名称": "站点名称",
+    "收货组织编码": "code",
+    "订货数量": "数量",
     "商品编码": "商品编码",
-    "商品名称": "商品名称",
-    "订货数量": "数量"
 }, inplace=True)
 
 manual.rename(columns={
-    "油站编码": "站点编码",
-    "油站名称": "站点名称",
+    "油站编码": "code",
+    "订货数量": "数量",
     "商品编码": "商品编码",
-    "订货数量": "数量"
 }, inplace=True)
+
+############################################################
+# 5. 合并订单
+############################################################
+
+oil["来源"] = "官网"
+manual["来源"] = "手工"
+
+orders = pd.concat([oil, manual], ignore_index=True)
+
+############################################################
+# 6. 匹配站点仓库
+############################################################
+
+orders = orders.merge(site[["code", "name", "warehouse"]], on="code", how="left")
+
+unmatched_sites = orders[orders["warehouse"].isna()]
+
+############################################################
+# 7. SKU 校验
+############################################################
 
 master.rename(columns={
     "商品编码": "商品编码",
-    "油站订货目录": "油站订货目录"
+    "油站订货目录": "可订",
 }, inplace=True)
 
+orders = orders.merge(master[["商品编码", "可订"]], on="商品编码", how="left")
 
-# ---------------------------------------------------
-# 从 Supabase 匹配仓库
-# ---------------------------------------------------
+unavailable_sku = orders[orders["可订"] != "油站可订"]
 
-def attach_site_info(df):
-    df["仓库"] = None
-    df["公司归属"] = None
-    df["站点名称（数据库）"] = None
+############################################################
+# 8. 正常订单
+############################################################
 
-    for idx, row in df.iterrows():
+valid_orders = orders.drop(unmatched_sites.index).drop(unavailable_sku.index)
 
-        code = str(row["站点编码"]).strip()
-        site = get_site_by_code(code)
+############################################################
+# 9. 下载按钮
+############################################################
 
-        if site:
-            df.at[idx, "仓库"] = site.get("warehouse")
-            df.at[idx, "公司归属"] = site.get("company")
-            df.at[idx, "站点名称（数据库）"] = site.get("name")
+def df_to_excel(df):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False)
+    return output.getvalue()
 
-    return df
-
-
-st.markdown("### 第二步：生成拣货单")
+st.markdown("## 📦 第二步：下载拣货单")
 
 if st.button("🚀 一键生成今日拣货单", type="primary"):
-
-    st.write("▶ 正在匹配 Supabase 站点仓库信息…")
-
-    oil = attach_site_info(oil)
-    manual = attach_site_info(manual)
-
-    oil["来源"] = "官网"
-    manual["来源"] = "手工"
-
-    orders = pd.concat([oil, manual], ignore_index=True)
-
-    # ---------------------------------------------------
-    # SKU 校验
-    # ---------------------------------------------------
-    st.write("▶ SKU 校验中…")
-
-    orders = orders.merge(
-        master[["商品编码", "油站订货目录"]],
-        on="商品编码",
-        how="left"
-    )
-
-    abnormal_sku = orders[
-        (orders["油站订货目录"].isna()) |
-        (orders["油站订货目录"] != "油站可订")
-    ]
-
-    abnormal_site = orders[orders["仓库"].isna()]
-
-    normal_orders = orders.drop(abnormal_sku.index).drop(abnormal_site.index)
-
-    st.success("校验完成！")
-
-    # ---------------------------------------------------
-    # 下载区
-    # ---------------------------------------------------
-    def df_to_excel(df):
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False)
-        return output.getvalue()
-
-    st.markdown("### 📦 第三步：下载拣货单（按仓库拆分）")
-
-    if normal_orders.empty:
-        st.warning("⚠ 没有正常订单，请检查文件")
+    if valid_orders.empty:
+        st.warning("⚠ 没有可用订单，请检查源文件")
     else:
-        for wh in normal_orders["仓库"].dropna().unique():
-            sub_df = normal_orders[normal_orders["仓库"] == wh]
+        for wh in valid_orders["warehouse"].dropna().unique():
+            df = valid_orders[valid_orders["warehouse"] == wh]
             st.download_button(
-                label=f"📦 下载拣货单：{wh}",
-                data=df_to_excel(sub_df),
+                label=f"📦 下载：{wh}",
+                data=df_to_excel(df),
                 file_name=f"拣货单_{wh}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
-    # ---------------------------------------------------
-    # 异常报告
-    # ---------------------------------------------------
-    st.markdown("---")
-    st.markdown("### 🧾 异常报告")
+############################################################
+# 10. 异常报告
+############################################################
 
-    col1, col2 = st.columns(2)
+st.markdown("---")
+st.markdown("### ❌ 异常站点")
+st.dataframe(unmatched_sites)
 
-    with col1:
-        st.write("❌ 异常 SKU（停订或未找到）")
-        st.dataframe(abnormal_sku)
-        st.download_button(
-            "下载异常 SKU",
-            df_to_excel(abnormal_sku),
-            "异常SKU.xlsx"
-        )
+st.markdown("### ❌ 异常 SKU")
+st.dataframe(unavailable_sku)
 
-    with col2:
-        st.write("❌ 异常站点（Supabase 未找到仓库）")
-        st.dataframe(abnormal_site)
-        st.download_button(
-            "下载异常站点",
-            df_to_excel(abnormal_site),
-            "异常站点.xlsx"
-        )
