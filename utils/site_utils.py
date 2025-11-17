@@ -1,14 +1,15 @@
-from utils.supabase_client import supabase
+from .supabase_client import supabase
 
-def get_site_by_code(code: str):
+
+def get_all_sites():
+    resp = supabase.table("sites").select("*").execute()
+    return resp.data or []
+
+
+def get_site_map():
     """
-    根据混合编码（code）查询站点信息
-    Supabase 表字段：code, name, warehouse, company
+    返回 dict:
+    {code: {"warehouse":..., "name":...}}
     """
-    resp = supabase.table("sites") \
-                   .select("*") \
-                   .eq("code", code) \
-                   .execute()
-    if resp.data:
-        return resp.data[0]
-    return None
+    rows = get_all_sites()
+    return {row["code"]: row for row in rows}
